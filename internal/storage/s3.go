@@ -65,6 +65,10 @@ func safeError(err error) error {
 			return errors.New("Бакет не найден")
 		case "AccessDenied", "InvalidAccessKeyId", "SignatureDoesNotMatch", "403":
 			return errors.New("Нет доступа к облачному хранилищу")
+		case "InvalidDigest", "BadDigest", "MissingContentMD5":
+			return errors.New("Ошибка контрольной суммы S3-запроса")
+		case "InvalidRequest", "InvalidArgument", "MalformedXML", "MalformedPolicy":
+			return errors.New("Некорректный формат S3-запроса")
 		}
 	}
 	if errors.Is(err, context.DeadlineExceeded) {
@@ -159,7 +163,7 @@ func (s *S3) Publish(ctx context.Context) error {
 	_, err := s.client.PutBucketPolicy(request, &s3.PutBucketPolicyInput{Bucket: aws.String(s.bucket), Policy: aws.String(policy)}, withContentMD5)
 	cancel()
 	if err != nil {
-		return safeError(err)
+		return fmt.Errorf("Не удалось настроить публичное чтение: %w", safeError(err))
 	}
 	request, cancel = context.WithTimeout(ctx, 45*time.Second)
 	defer cancel()
@@ -169,7 +173,10 @@ func (s *S3) Publish(ctx context.Context) error {
 			ErrorDocument: &types.ErrorDocument{Key: aws.String("error.html")},
 		},
 	}, withContentMD5)
-	return safeError(err)
+	if err != nil {
+		return fmt.Errorf("Не удалось настроить хостинг: %w", safeError(err))
+	}
+	return nil
 }
 
 // S3 API Яндекса требует Content-MD5 для XML пакетного удаления.

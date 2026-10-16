@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -125,5 +126,32 @@ func TestPublishOnlyAllowsObjectReads(t *testing.T) {
 	}
 	if err := json.Unmarshal([]byte(policy), &document); err != nil || len(document.Statement) != 1 || document.Statement[0].Action != "s3:GetObject" || document.Statement[0].Resource != "arn:aws:s3:::test.example/*" || !website {
 		t.Fatal("unsafe or incomplete publication settings")
+	}
+}
+
+func TestPublishErrorIdentifiesStepWithoutResponsePayload(t *testing.T) {
+	for _, denied := range []string{"policy", "website"} {
+		t.Run(denied, func(t *testing.T) {
+			store := testStore(t, func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Query().Has(denied) {
+					w.Header().Set("Content-Type", "application/xml")
+					w.WriteHeader(http.StatusForbidden)
+					io.WriteString(w, `<Error><Code>AccessDenied</Code><Message>fake-secret</Message></Error>`)
+					return
+				}
+				w.WriteHeader(http.StatusNoContent)
+			})
+			err := store.Publish(context.Background())
+			if err == nil || strings.Contains(err.Error(), "fake-secret") {
+				t.Fatal("unsafe error")
+			}
+			step := "публичное чтение"
+			if denied == "website" {
+				step = "хостинг"
+			}
+			if !strings.Contains(err.Error(), step) {
+				t.Fatal("missing operation context")
+			}
+		})
 	}
 }

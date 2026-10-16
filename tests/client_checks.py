@@ -41,7 +41,12 @@ def main():
     def call(*args, success=True):
         result = subprocess.run(command + list(args), env=environment, capture_output=True, timeout=150)
         if result.returncode != (0 if success else 1):
-            raise RuntimeError("Ошибка команды " + args[0])
+            safe = {"Нет доступа к облачному хранилищу", "Ошибка обращения к облачному хранилищу",
+                    "Ошибка контрольной суммы S3-запроса", "Некорректный формат S3-запроса",
+                    "Хранилище не ответило вовремя", "Бакет не найден"}
+            safe |= {prefix + ": " + reason for prefix in ("Не удалось настроить публичное чтение", "Не удалось настроить хостинг") for reason in list(safe)}
+            detail = result.stderr.decode(errors="replace").strip()
+            raise RuntimeError("Ошибка команды " + args[0] + ((": " + detail) if detail in safe else ""))
         if success and result.stderr:
             raise RuntimeError("Неожиданный stderr команды " + args[0])
         if not success and result.stdout:
@@ -153,7 +158,14 @@ def main():
     except (OSError, ValueError, subprocess.TimeoutExpired):
         report["error"] = "Клиентская проверка не завершена; значения учётных данных скрыты"
     finally:
+        try:
+            remaining = call("list").splitlines()
+        except (RuntimeError, subprocess.TimeoutExpired):
+            remaining = albums
+            report["cleanup_incomplete"] = True
         for album in albums:
+            if album not in remaining:
+                continue
             try:
                 call("delete", "--album", album)
             except (RuntimeError, subprocess.TimeoutExpired):

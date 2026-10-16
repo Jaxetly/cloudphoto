@@ -51,6 +51,13 @@ resource "yandex_storage_bucket" "photos" {
       condition     = data.yandex_cm_certificate.existing.status == "ISSUED"
       error_message = "Сертификат ещё не выпущен."
     }
+    precondition {
+      condition = (
+        contains(data.yandex_cm_certificate.existing.domains, local.site_domain) ||
+        contains(data.yandex_cm_certificate.existing.domains, "*.${local.zone_domain}")
+      ) && timecmp(data.yandex_cm_certificate.existing.not_after, plantimestamp()) > 0
+      error_message = "Сертификат должен покрывать адрес сайта и быть действующим."
+    }
   }
 }
 
