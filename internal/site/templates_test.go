@@ -45,6 +45,14 @@ func TestEscapingPreservesPhotoURL(t *testing.T) {
 	if parseErr != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
 		t.Fatal("filename changed into query or fragment")
 	}
+	_, after, found := strings.Cut(s, `data-title="`)
+	if !found || html.UnescapeString(strings.SplitN(after, `"`, 2)[0]) != name {
+		t.Fatal("filename did not roundtrip through the album template")
+	}
+	_, caption, found := strings.Cut(s, `<p id="photo-name" aria-live="polite">`)
+	if !found || html.UnescapeString(strings.SplitN(caption, `</p>`, 2)[0]) != name {
+		t.Fatal("first filename is not visible below the gallery")
+	}
 	if !strings.Contains(s, "galleria/1.6.1") || !strings.Contains(s, "jquery/3.6.0") {
 		t.Fatal("required gallery dependencies missing")
 	}

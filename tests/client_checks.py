@@ -44,7 +44,7 @@ def main():
             safe = {"Нет доступа к облачному хранилищу", "Ошибка обращения к облачному хранилищу",
                     "Ошибка контрольной суммы S3-запроса", "Некорректный формат S3-запроса",
                     "Хранилище не ответило вовремя", "Бакет не найден"}
-            safe |= {prefix + ": " + reason for prefix in ("Не удалось прочитать политику доступа", "Не удалось настроить публичное чтение", "Не удалось настроить хостинг") for reason in list(safe)}
+            safe |= {prefix + ": " + reason for prefix in ("Не удалось прочитать политику доступа", "Не удалось открыть чтение фотографии", "Не удалось настроить публичное чтение", "Не удалось настроить хостинг") for reason in list(safe)}
             detail = result.stderr.decode(errors="replace").strip()
             raise RuntimeError("Ошибка команды " + args[0] + ((": " + detail) if detail in safe else ""))
         if success and result.stderr:
@@ -134,10 +134,11 @@ def main():
                 raise RuntimeError("Не работает страница ошибки")
             passed("mksite, HTTPS, галерея, пустой альбом, ссылки на фото и error.html")
             endpoint = "https://storage.yandexcloud.net/" + urllib.parse.quote(settings["BUCKET"], safe="")
-            for suffix in ("?list-type=2", "?website"):
+            marker = "/albums/" + albums[0].encode().hex() + "/.album"
+            for suffix in ("?list-type=2", "?website", "?policy", "/index.html?acl", marker):
                 status, _ = fetch(endpoint + suffix)
                 if status not in (401, 403):
-                    raise RuntimeError("Публично доступен листинг или конфигурация бакета")
+                    raise RuntimeError("Публично доступен листинг, конфигурация или служебный объект")
             prefix = "albums/" + albums[0].encode().hex() + "/photos/"
             probe = endpoint + "/" + prefix + "anonymous-check.jpg"
             status, _ = fetch(probe, data=b"probe", method="PUT")
@@ -147,7 +148,7 @@ def main():
             status, _ = fetch(endpoint + "/" + prefix + "A.JPG", method="DELETE")
             if status not in (401, 403):
                 raise RuntimeError("Публичное удаление разрешено")
-            passed("Анонимные листинг, конфигурация, запись и удаление запрещены")
+            passed("Анонимные листинг, конфигурация, ACL, служебные объекты, запись и удаление запрещены")
             call("delete", "--album", albums[0], "--photo", "missing.jpg", success=False)
             call("list", "--album", "missing-" + uuid.uuid4().hex, success=False)
             call("upload", success=False)

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -27,8 +28,9 @@ type Store interface {
 	List(context.Context, string) ([]string, error)
 	Get(context.Context, string) (io.ReadCloser, error)
 	Put(context.Context, string, io.Reader, int64, string) error
+	PutPublic(context.Context, string, io.Reader, int64, string) error
 	Delete(context.Context, []string) error
-	Publish(context.Context) error
+	Publish(context.Context, []string) error
 }
 
 type S3 struct {
@@ -88,15 +90,24 @@ func (s *S3) List(ctx context.Context, prefix string) ([]string, error) {
 		request, cancel := context.WithTimeout(ctx, 45*time.Second)
 		page, err := s.client.ListObjectsV2(request, &s3.ListObjectsV2Input{
 			Bucket: aws.String(s.bucket), Prefix: aws.String(prefix), ContinuationToken: token,
+			EncodingType: types.EncodingTypeUrl,
 		})
 		cancel()
 		if err != nil {
 			return nil, safeError(err)
 		}
 		for _, object := range page.Contents {
-			if object.Key != nil {
-				keys = append(keys, *object.Key)
+			if object.Key == nil {
+				continue
 			}
+			key := *object.Key
+			if page.EncodingType == types.EncodingTypeUrl {
+				key, err = url.PathUnescape(key)
+				if err != nil {
+					return nil, errors.New("Хранилище вернуло некорректный ключ объекта")
+				}
+			}
+			keys = append(keys, key)
 		}
 		if !aws.ToBool(page.IsTruncated) {
 			return keys, nil
@@ -128,38 +139,38 @@ type timedBody struct {
 func (body *timedBody) Close() error { err := body.ReadCloser.Close(); body.cancel(); return err }
 
 func (s *S3) Put(ctx context.Context, key string, body io.Reader, size int64, contentType string) error {
+	return s.put(ctx, key, body, size, contentType, "", nil)
+}
+
+func (s *S3) PutPublic(ctx context.Context, key string, body io.Reader, size int64, contentType string) error {
+	return s.put(ctx, key, body, size, contentType, types.ObjectCannedACLPublicRead, aws.String("no-cache"))
+}
+
+func (s *S3) put(ctx context.Context, key string, body io.Reader, size int64, contentType string, acl types.ObjectCannedACL, cacheControl *string) error {
 	request, cancel := context.WithTimeout(ctx, 45*time.Second)
 	defer cancel()
 	_, err := s.client.PutObject(request, &s3.PutObjectInput{
 		Bucket: aws.String(s.bucket), Key: aws.String(key), Body: body,
-		ContentLength: aws.Int64(size), ContentType: aws.String(contentType),
+		ContentLength: aws.Int64(size), ContentType: aws.String(contentType), ACL: acl, CacheControl: cacheControl,
 	})
 	return safeError(err)
 }
 
 func (s *S3) Delete(ctx context.Context, keys []string) error {
-	for start := 0; start < len(keys); start += 1000 {
-		end := min(start+1000, len(keys))
-		objects := make([]types.ObjectIdentifier, 0, end-start)
-		for _, key := range keys[start:end] {
-			objects = append(objects, types.ObjectIdentifier{Key: aws.String(key)})
-		}
+	for _, key := range keys {
 		request, cancel := context.WithTimeout(ctx, 45*time.Second)
-		result, err := s.client.DeleteObjects(request, &s3.DeleteObjectsInput{
-			Bucket: aws.String(s.bucket), Delete: &types.Delete{Objects: objects, Quiet: aws.Bool(true)},
-		}, withContentMD5)
+		_, err := s.client.DeleteObject(request, &s3.DeleteObjectInput{
+			Bucket: aws.String(s.bucket), Key: aws.String(key),
+		})
 		cancel()
 		if err != nil {
 			return safeError(err)
-		}
-		if len(result.Errors) != 0 {
-			return errors.New("Не все объекты удалось удалить")
 		}
 	}
 	return nil
 }
 
-func (s *S3) Publish(ctx context.Context) error {
+func (s *S3) Publish(ctx context.Context, photos []string) error {
 	request, cancel := context.WithTimeout(ctx, 45*time.Second)
 	existing, err := s.client.GetBucketPolicy(request, &s3.GetBucketPolicyInput{Bucket: aws.String(s.bucket)})
 	cancel()
@@ -210,6 +221,17 @@ func (s *S3) Publish(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("Не удалось настроить публичное чтение: %w", safeError(err))
 	}
+	// Публичным становится только содержимое сайта, а не ACL всего бакета.
+	for _, key := range photos {
+		request, cancel = context.WithTimeout(ctx, 45*time.Second)
+		_, err = s.client.PutObjectAcl(request, &s3.PutObjectAclInput{
+			Bucket: aws.String(s.bucket), Key: aws.String(key), ACL: types.ObjectCannedACLPublicRead,
+		}, withContentMD5)
+		cancel()
+		if err != nil {
+			return fmt.Errorf("Не удалось открыть чтение фотографии: %w", safeError(err))
+		}
+	}
 	request, cancel = context.WithTimeout(ctx, 45*time.Second)
 	defer cancel()
 	_, err = s.client.PutBucketWebsite(request, &s3.PutBucketWebsiteInput{
@@ -224,8 +246,7 @@ func (s *S3) Publish(ctx context.Context) error {
 	return nil
 }
 
-// S3 API Яндекса требует Content-MD5 для XML пакетного удаления.
-// MD5 здесь служит контрольной суммой запроса, а не защитой учётных данных.
+// Content-MD5 служит контрольной суммой запросов настройки публикации.
 func withContentMD5(options *s3.Options) {
 	options.APIOptions = append(options.APIOptions, func(stack *middleware.Stack) error {
 		return stack.Build.Add(middleware.BuildMiddlewareFunc("ContentMD5", func(ctx context.Context, in middleware.BuildInput, next middleware.BuildHandler) (middleware.BuildOutput, middleware.Metadata, error) {
@@ -234,8 +255,10 @@ func withContentMD5(options *s3.Options) {
 				return middleware.BuildOutput{}, middleware.Metadata{}, errors.New("Некорректный S3-запрос")
 			}
 			hash := md5.New()
-			if _, err := io.Copy(hash, request.GetStream()); err != nil {
-				return middleware.BuildOutput{}, middleware.Metadata{}, err
+			if stream := request.GetStream(); stream != nil {
+				if _, err := io.Copy(hash, stream); err != nil {
+					return middleware.BuildOutput{}, middleware.Metadata{}, err
+				}
 			}
 			if err := request.RewindStream(); err != nil {
 				return middleware.BuildOutput{}, middleware.Metadata{}, err

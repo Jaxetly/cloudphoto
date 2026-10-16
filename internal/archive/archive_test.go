@@ -18,6 +18,8 @@ type memory struct {
 	objects                      map[string][]byte
 	failPut, failGet, failDelete string
 	published                    bool
+	publicPhotos                 []string
+	publicPages                  []string
 	deletes                      [][]string
 }
 
@@ -61,7 +63,15 @@ func (m *memory) Delete(_ context.Context, keys []string) error {
 	}
 	return nil
 }
-func (m *memory) Publish(context.Context) error { m.published = true; return nil }
+func (m *memory) Publish(_ context.Context, photos []string) error {
+	m.published = true
+	m.publicPhotos = append([]string(nil), photos...)
+	return nil
+}
+func (m *memory) PutPublic(ctx context.Context, key string, body io.Reader, size int64, contentType string) error {
+	m.publicPages = append(m.publicPages, key)
+	return m.Put(ctx, key, body, size, contentType)
+}
 
 func write(t *testing.T, dir, name, contents string) {
 	t.Helper()

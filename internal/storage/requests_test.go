@@ -1,13 +1,10 @@
 package storage
 
 import (
-	"bytes"
 	"context"
 	"crypto/md5"
 	"encoding/base64"
 	"encoding/json"
-	"encoding/xml"
-	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -33,19 +30,28 @@ func testStore(t *testing.T, handler http.HandlerFunc) *S3 {
 }
 
 func TestListReadsEveryPage(t *testing.T) {
+	const token = "page+2%2F"
 	requests := 0
 	store := testStore(t, func(w http.ResponseWriter, r *http.Request) {
 		requests++
 		w.Header().Set("Content-Type", "application/xml")
-		if r.URL.Query().Get("continuation-token") == "" {
-			io.WriteString(w, `<ListBucketResult><IsTruncated>true</IsTruncated><NextContinuationToken>page-2</NextContinuationToken><Contents><Key>albums/a</Key></Contents></ListBucketResult>`)
-		} else {
-			io.WriteString(w, `<ListBucketResult><IsTruncated>false</IsTruncated><Contents><Key>albums/b</Key></Contents></ListBucketResult>`)
+		query := r.URL.Query()
+		if query.Get("encoding-type") != "url" || query.Get("prefix") != "albums/" {
+			t.Error("listing must request URL encoding for object keys")
+		}
+		switch query.Get("continuation-token") {
+		case "":
+			io.WriteString(w, `<ListBucketResult><EncodingType>url</EncodingType><IsTruncated>true</IsTruncated><NextContinuationToken>`+token+`</NextContinuationToken><Contents><Key>albums%2Fa%2Fphotos%2F%25%0D+.jpg</Key></Contents></ListBucketResult>`)
+		case token:
+			io.WriteString(w, `<ListBucketResult><EncodingType>url</EncodingType><IsTruncated>false</IsTruncated><Contents><Key>albums%2Fb%2F.album</Key></Contents></ListBucketResult>`)
+		default:
+			t.Error("continuation token was altered")
+			w.WriteHeader(http.StatusBadRequest)
 		}
 	})
 	keys, err := store.List(context.Background(), "albums/")
-	if err != nil || requests != 2 || !reflect.DeepEqual(keys, []string{"albums/a", "albums/b"}) {
-		t.Fatal("incomplete listing")
+	if err != nil || requests != 2 || !reflect.DeepEqual(keys, []string{"albums/a/photos/%\r+.jpg", "albums/b/.album"}) {
+		t.Fatalf("unexpected listing: %q, %v", keys, err)
 	}
 }
 
@@ -62,39 +68,30 @@ func TestBrokenPaginationFailsWithoutPartialResult(t *testing.T) {
 	}
 }
 
-func TestDeleteBatchesAndPerObjectErrors(t *testing.T) {
-	var counts []int
-	failed := false
+func TestDeleteTargetsOnlyExactObjectPathsAndStopsOnFailure(t *testing.T) {
+	keys := []string{"albums/61/photos/Море + #.JPG", "albums/61/.album", "album7.html"}
+	var deleted []string
 	store := testStore(t, func(w http.ResponseWriter, r *http.Request) {
-		body, _ := io.ReadAll(r.Body)
-		sum := md5.Sum(body)
-		if r.Header.Get("Content-MD5") != base64.StdEncoding.EncodeToString(sum[:]) || r.ContentLength != int64(len(body)) {
-			t.Error("required Content-MD5 or Content-Length missing")
+		query := r.URL.RawQuery
+		if r.Method != http.MethodDelete || (query != "" && query != "x-id=DeleteObject") || !strings.HasPrefix(r.URL.Path, "/test.example/") {
+			t.Error("expected DELETE on an exact object URL")
+			w.WriteHeader(http.StatusBadRequest)
+			return
 		}
-		var request struct {
-			Objects []struct{ Key string } `xml:"Object"`
+		key := strings.TrimPrefix(r.URL.Path, "/test.example/")
+		deleted = append(deleted, key)
+		if key == keys[1] {
+			w.WriteHeader(http.StatusForbidden)
+			io.WriteString(w, `<Error><Code>AccessDenied</Code><Message>fake-secret</Message></Error>`)
+			return
 		}
-		if err := xml.NewDecoder(bytes.NewReader(body)).Decode(&request); err != nil {
-			t.Error(err)
-		}
-		counts = append(counts, len(request.Objects))
-		w.Header().Set("Content-Type", "application/xml")
-		if failed {
-			io.WriteString(w, `<DeleteResult><Error><Key>test.jpg</Key><Code>AccessDenied</Code><Message>fake-secret</Message></Error></DeleteResult>`)
-		} else {
-			io.WriteString(w, `<DeleteResult/>`)
-		}
+		w.WriteHeader(http.StatusNoContent)
 	})
-	keys := make([]string, 2001)
-	for i := range keys {
-		keys[i] = fmt.Sprintf("photo%d.jpg", i)
+	if err := store.Delete(context.Background(), nil); err != nil || len(deleted) != 0 {
+		t.Fatal("empty delete made a request")
 	}
-	if err := store.Delete(context.Background(), keys); err != nil || !reflect.DeepEqual(counts, []int{1000, 1000, 1}) {
-		t.Fatal("incorrect delete batching")
-	}
-	failed = true
-	if err := store.Delete(context.Background(), []string{"test.jpg"}); err == nil {
-		t.Fatal("partial delete error hidden")
+	if err := store.Delete(context.Background(), keys); err == nil || strings.Contains(err.Error(), "fake-secret") || !reflect.DeepEqual(deleted, keys[:2]) {
+		t.Fatal("delete did not stop safely after the first failing object")
 	}
 }
 
@@ -121,7 +118,7 @@ func TestPublishKeepsAuthenticatedAccessAndOnlyPublicReads(t *testing.T) {
 		}
 		w.WriteHeader(http.StatusNoContent)
 	})
-	if err := store.Publish(context.Background()); err != nil {
+	if err := store.Publish(context.Background(), nil); err != nil {
 		t.Fatal(err)
 	}
 	var document struct {
@@ -160,7 +157,7 @@ func TestPublishKeepsAuthenticatedAccessAndOnlyPublicReads(t *testing.T) {
 }
 
 func TestPublishErrorIdentifiesStepWithoutResponsePayload(t *testing.T) {
-	for _, denied := range []string{"policy", "website"} {
+	for _, denied := range []string{"policy", "acl", "website"} {
 		t.Run(denied, func(t *testing.T) {
 			store := testStore(t, func(w http.ResponseWriter, r *http.Request) {
 				if r.Method == http.MethodGet {
@@ -177,7 +174,7 @@ func TestPublishErrorIdentifiesStepWithoutResponsePayload(t *testing.T) {
 				}
 				w.WriteHeader(http.StatusNoContent)
 			})
-			err := store.Publish(context.Background())
+			err := store.Publish(context.Background(), []string{"albums/test/photos/test.jpg"})
 			if err == nil || strings.Contains(err.Error(), "fake-secret") {
 				t.Fatal("unsafe error")
 			}
@@ -185,10 +182,57 @@ func TestPublishErrorIdentifiesStepWithoutResponsePayload(t *testing.T) {
 			if denied == "website" {
 				step = "хостинг"
 			}
+			if denied == "acl" {
+				step = "чтение фотографии"
+			}
 			if !strings.Contains(err.Error(), step) {
 				t.Fatal("missing operation context")
 			}
 		})
+	}
+}
+
+func TestPublishOnlyOpensSpecifiedPhotoObjects(t *testing.T) {
+	var public []string
+	store := testStore(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			io.WriteString(w, `{"Version":"2012-10-17","Statement":[]}`)
+			return
+		}
+		if r.URL.Query().Has("acl") {
+			if r.URL.Path == "/test.example" || r.URL.Path == "/test.example/" {
+				t.Error("bucket ACL must remain private")
+			}
+			if r.Header.Get("X-Amz-Acl") != "public-read" || r.Header.Get("Content-MD5") != "1B2M2Y8AsgTpgAmY7PhCfg==" {
+				t.Error("unsafe object ACL")
+			}
+			public = append(public, r.URL.Path)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+	photos := []string{"albums/61/photos/A.JPG", "albums/62/photos/Фото #.jpg"}
+	if err := store.Publish(context.Background(), photos); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(public, []string{"/test.example/" + photos[0], "/test.example/" + photos[1]}) {
+		t.Fatal("publication changed unrelated objects")
+	}
+}
+
+func TestPageUploadIsPublicButOrdinaryUploadIsPrivate(t *testing.T) {
+	var permissions []string
+	store := testStore(t, func(w http.ResponseWriter, r *http.Request) {
+		permissions = append(permissions, r.Header.Get("X-Amz-Acl"))
+		w.WriteHeader(http.StatusOK)
+	})
+	if err := store.Put(context.Background(), "photo.jpg", strings.NewReader("photo"), 5, "image/jpeg"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PutPublic(context.Background(), "index.html", strings.NewReader("page"), 4, "text/html"); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(permissions, []string{"", "public-read"}) {
+		t.Fatal("unexpected publication permissions")
 	}
 }
 
@@ -206,7 +250,7 @@ func TestPublishPreservesExistingRulesWithoutDuplicates(t *testing.T) {
 		w.WriteHeader(http.StatusNoContent)
 	})
 	for range 2 {
-		if err := store.Publish(context.Background()); err != nil {
+		if err := store.Publish(context.Background(), nil); err != nil {
 			t.Fatal(err)
 		}
 		var document struct{ Statement []map[string]any }
@@ -231,7 +275,7 @@ func TestUnreadablePolicyIsNotOverwritten(t *testing.T) {
 			}
 			io.WriteString(w, body)
 		})
-		err := store.Publish(context.Background())
+		err := store.Publish(context.Background(), nil)
 		if err == nil || strings.Contains(err.Error(), "fake-secret") {
 			t.Fatal("unsafe policy handling")
 		}

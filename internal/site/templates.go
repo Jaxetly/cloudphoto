@@ -3,6 +3,7 @@ package site
 import (
 	"bytes"
 	"html/template"
+	"io"
 	"net/url"
 	"strings"
 )
@@ -25,6 +26,13 @@ func render(source string, value any) ([]byte, error) {
 
 func Index(albums []AlbumLink) ([]byte, error) { return render(indexTemplate, albums) }
 func Error() []byte                            { return []byte(errorTemplate) }
+
+// Проверяем начало шаблона, включая страницы, сгенерированные прежней версией.
+func IsAlbumPage(body io.Reader) (bool, error) {
+	const prefix = "<!doctype html>\n<html>\n    <head>\n        <meta charset=\"utf-8\">\n        <title>Фотоальбом \""
+	data, err := io.ReadAll(io.LimitReader(body, int64(len(prefix))))
+	return string(data) == prefix, err
+}
 
 func Album(name string, photos []Photo) ([]byte, error) {
 	images := make([]image, len(photos))
@@ -65,23 +73,51 @@ const albumTemplate = `<!doctype html>
         {{if .Images}}<link rel="stylesheet" type="text/css" href="https://cdnjs.cloudflare.com/ajax/libs/galleria/1.6.1/themes/classic/galleria.classic.min.css" />
         <style>
             .galleria{ width: 960px; height: 540px; background: #000 }
+            #photo-name{ max-width: 960px; overflow-wrap: anywhere }
         </style>
         <script src="https://ajax.googleapis.com/ajax/libs/jquery/3.6.0/jquery.min.js"></script>
         <script src="https://cdnjs.cloudflare.com/ajax/libs/galleria/1.6.1/galleria.min.js"></script>
         <script src="https://cdnjs.cloudflare.com/ajax/libs/galleria/1.6.1/themes/classic/galleria.classic.min.js"></script>{{end}}
     </head>
     <body>
+        <main id="album-content" data-album="{{.Name}}">
         <h1>Фотоальбом "{{.Name}}"</h1>
         {{if .Images}}<div class="galleria">
-            {{range .Images}}<img src="{{.URL}}" data-title="{{.Name}}">
+            {{range .Images}}<img src="{{.URL}}" alt="" data-title="{{.Name}}">
             {{end}}
-        </div>{{else}}<p>Фотоальбом пустой.</p>{{end}}
+        </div>
+        <p id="photo-name" aria-live="polite">{{(index .Images 0).Name}}</p>{{else}}<p>Фотоальбом пустой.</p>{{end}}
+        </main>
         <p>Вернуться на <a href="index.html">главную страницу</a> фотоархива</p>
-        {{if .Images}}<script>
+        <script>
             (function() {
-                Galleria.run('.galleria');
+                var content = document.getElementById('album-content');
+                var album = content.dataset.album;
+                var url = new URL(window.location.href);
+                var openedAlbum = url.searchParams.get('album');
+                if (openedAlbum !== null && openedAlbum !== album) {
+                    content.textContent = 'Альбом больше недоступен по этому адресу.';
+                    return;
+                }
+                if (openedAlbum === null) {
+                    url.searchParams.set('album', album);
+                    history.replaceState(null, '', url);
+                }
+                {{if .Images}}var names = Array.from(content.querySelectorAll('.galleria img'), function(photo) {
+                    var name = photo.dataset.title;
+                    // Galleria вставляет data-title как HTML. Подпись выводим отдельно как текст.
+                    photo.removeAttribute('data-title');
+                    return name;
+                });
+                var caption = document.getElementById('photo-name');
+                Galleria.ready(function() {
+                    this.bind('image', function(event) {
+                        caption.textContent = names[event.index];
+                    });
+                });
+                Galleria.run('.galleria');{{end}}
             }());
-        </script>{{end}}
+        </script>
     </body>
 </html>
 `
