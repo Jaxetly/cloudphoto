@@ -22,8 +22,15 @@ func TestSiteNumberingAndRepeatedPublication(t *testing.T) {
 	}
 	prefix, _ := albumPrefix("A")
 	m.objects[prefix+"photos/Фото #.jpg"] = []byte("photo")
+	m.objects["private.txt"] = []byte("unrelated")
 	if err := a.MakeSite(ctx); err != nil {
 		t.Fatal(err)
+	}
+	if len(m.publicPhotos) != 1 || m.publicPhotos[0] != prefix+"photos/Фото #.jpg" {
+		t.Fatal("album markers or unrelated objects published")
+	}
+	if m.publicPages[len(m.publicPages)-1] != "index.html" {
+		t.Fatal("index must be published last")
 	}
 	index := string(m.objects["index.html"])
 	if !strings.Contains(index, `href="album1.html">A</a>`) || !strings.Contains(index, `href="album2.html">a</a>`) {

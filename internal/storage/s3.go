@@ -27,8 +27,9 @@ type Store interface {
 	List(context.Context, string) ([]string, error)
 	Get(context.Context, string) (io.ReadCloser, error)
 	Put(context.Context, string, io.Reader, int64, string) error
+	PutPublic(context.Context, string, io.Reader, int64, string) error
 	Delete(context.Context, []string) error
-	Publish(context.Context) error
+	Publish(context.Context, []string) error
 }
 
 type S3 struct {
@@ -128,11 +129,19 @@ type timedBody struct {
 func (body *timedBody) Close() error { err := body.ReadCloser.Close(); body.cancel(); return err }
 
 func (s *S3) Put(ctx context.Context, key string, body io.Reader, size int64, contentType string) error {
+	return s.put(ctx, key, body, size, contentType, "")
+}
+
+func (s *S3) PutPublic(ctx context.Context, key string, body io.Reader, size int64, contentType string) error {
+	return s.put(ctx, key, body, size, contentType, types.ObjectCannedACLPublicRead)
+}
+
+func (s *S3) put(ctx context.Context, key string, body io.Reader, size int64, contentType string, acl types.ObjectCannedACL) error {
 	request, cancel := context.WithTimeout(ctx, 45*time.Second)
 	defer cancel()
 	_, err := s.client.PutObject(request, &s3.PutObjectInput{
 		Bucket: aws.String(s.bucket), Key: aws.String(key), Body: body,
-		ContentLength: aws.Int64(size), ContentType: aws.String(contentType),
+		ContentLength: aws.Int64(size), ContentType: aws.String(contentType), ACL: acl,
 	})
 	return safeError(err)
 }
@@ -159,7 +168,7 @@ func (s *S3) Delete(ctx context.Context, keys []string) error {
 	return nil
 }
 
-func (s *S3) Publish(ctx context.Context) error {
+func (s *S3) Publish(ctx context.Context, photos []string) error {
 	request, cancel := context.WithTimeout(ctx, 45*time.Second)
 	existing, err := s.client.GetBucketPolicy(request, &s3.GetBucketPolicyInput{Bucket: aws.String(s.bucket)})
 	cancel()
@@ -210,6 +219,17 @@ func (s *S3) Publish(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("Не удалось настроить публичное чтение: %w", safeError(err))
 	}
+	// Публичным становится только содержимое сайта, а не ACL всего бакета.
+	for _, key := range photos {
+		request, cancel = context.WithTimeout(ctx, 45*time.Second)
+		_, err = s.client.PutObjectAcl(request, &s3.PutObjectAclInput{
+			Bucket: aws.String(s.bucket), Key: aws.String(key), ACL: types.ObjectCannedACLPublicRead,
+		}, withContentMD5)
+		cancel()
+		if err != nil {
+			return fmt.Errorf("Не удалось открыть чтение фотографии: %w", safeError(err))
+		}
+	}
 	request, cancel = context.WithTimeout(ctx, 45*time.Second)
 	defer cancel()
 	_, err = s.client.PutBucketWebsite(request, &s3.PutBucketWebsiteInput{
@@ -234,8 +254,10 @@ func withContentMD5(options *s3.Options) {
 				return middleware.BuildOutput{}, middleware.Metadata{}, errors.New("Некорректный S3-запрос")
 			}
 			hash := md5.New()
-			if _, err := io.Copy(hash, request.GetStream()); err != nil {
-				return middleware.BuildOutput{}, middleware.Metadata{}, err
+			if stream := request.GetStream(); stream != nil {
+				if _, err := io.Copy(hash, stream); err != nil {
+					return middleware.BuildOutput{}, middleware.Metadata{}, err
+				}
 			}
 			if err := request.RewindStream(); err != nil {
 				return middleware.BuildOutput{}, middleware.Metadata{}, err

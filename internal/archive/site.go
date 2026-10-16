@@ -20,6 +20,7 @@ func (a *Archive) MakeSite(ctx context.Context) error {
 	}
 	pages := make([]page, 0, len(albums)+2)
 	links := make([]site.AlbumLink, 0, len(albums))
+	var publicPhotos []string
 	for i, album := range albums {
 		photos, err := a.Photos(ctx, album)
 		if err != nil {
@@ -28,6 +29,7 @@ func (a *Archive) MakeSite(ctx context.Context) error {
 		images := make([]site.Photo, len(photos))
 		for j, p := range photos {
 			images[j] = site.Photo{Name: p.Name, Key: p.Key}
+			publicPhotos = append(publicPhotos, p.Key)
 		}
 		body, err := site.Album(album, images)
 		if err != nil {
@@ -42,11 +44,11 @@ func (a *Archive) MakeSite(ctx context.Context) error {
 		return errors.New("Не удалось сформировать главную страницу")
 	}
 	pages = append(pages, page{"error.html", site.Error()}, page{"index.html", index})
-	if err := a.Store.Publish(ctx); err != nil {
+	if err := a.Store.Publish(ctx, publicPhotos); err != nil {
 		return err
 	}
 	for _, p := range pages {
-		if err := a.Store.Put(ctx, p.key, bytes.NewReader(p.body), int64(len(p.body)), "text/html; charset=utf-8"); err != nil {
+		if err := a.Store.PutPublic(ctx, p.key, bytes.NewReader(p.body), int64(len(p.body)), "text/html; charset=utf-8"); err != nil {
 			return err
 		}
 	}

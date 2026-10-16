@@ -121,7 +121,7 @@ func TestPublishKeepsAuthenticatedAccessAndOnlyPublicReads(t *testing.T) {
 		}
 		w.WriteHeader(http.StatusNoContent)
 	})
-	if err := store.Publish(context.Background()); err != nil {
+	if err := store.Publish(context.Background(), nil); err != nil {
 		t.Fatal(err)
 	}
 	var document struct {
@@ -160,7 +160,7 @@ func TestPublishKeepsAuthenticatedAccessAndOnlyPublicReads(t *testing.T) {
 }
 
 func TestPublishErrorIdentifiesStepWithoutResponsePayload(t *testing.T) {
-	for _, denied := range []string{"policy", "website"} {
+	for _, denied := range []string{"policy", "acl", "website"} {
 		t.Run(denied, func(t *testing.T) {
 			store := testStore(t, func(w http.ResponseWriter, r *http.Request) {
 				if r.Method == http.MethodGet {
@@ -177,7 +177,7 @@ func TestPublishErrorIdentifiesStepWithoutResponsePayload(t *testing.T) {
 				}
 				w.WriteHeader(http.StatusNoContent)
 			})
-			err := store.Publish(context.Background())
+			err := store.Publish(context.Background(), []string{"albums/test/photos/test.jpg"})
 			if err == nil || strings.Contains(err.Error(), "fake-secret") {
 				t.Fatal("unsafe error")
 			}
@@ -185,10 +185,57 @@ func TestPublishErrorIdentifiesStepWithoutResponsePayload(t *testing.T) {
 			if denied == "website" {
 				step = "хостинг"
 			}
+			if denied == "acl" {
+				step = "чтение фотографии"
+			}
 			if !strings.Contains(err.Error(), step) {
 				t.Fatal("missing operation context")
 			}
 		})
+	}
+}
+
+func TestPublishOnlyOpensSpecifiedPhotoObjects(t *testing.T) {
+	var public []string
+	store := testStore(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			io.WriteString(w, `{"Version":"2012-10-17","Statement":[]}`)
+			return
+		}
+		if r.URL.Query().Has("acl") {
+			if r.URL.Path == "/test.example" || r.URL.Path == "/test.example/" {
+				t.Error("bucket ACL must remain private")
+			}
+			if r.Header.Get("X-Amz-Acl") != "public-read" || r.Header.Get("Content-MD5") != "1B2M2Y8AsgTpgAmY7PhCfg==" {
+				t.Error("unsafe object ACL")
+			}
+			public = append(public, r.URL.Path)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+	photos := []string{"albums/61/photos/A.JPG", "albums/62/photos/Фото #.jpg"}
+	if err := store.Publish(context.Background(), photos); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(public, []string{"/test.example/" + photos[0], "/test.example/" + photos[1]}) {
+		t.Fatal("publication changed unrelated objects")
+	}
+}
+
+func TestPageUploadIsPublicButOrdinaryUploadIsPrivate(t *testing.T) {
+	var permissions []string
+	store := testStore(t, func(w http.ResponseWriter, r *http.Request) {
+		permissions = append(permissions, r.Header.Get("X-Amz-Acl"))
+		w.WriteHeader(http.StatusOK)
+	})
+	if err := store.Put(context.Background(), "photo.jpg", strings.NewReader("photo"), 5, "image/jpeg"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PutPublic(context.Background(), "index.html", strings.NewReader("page"), 4, "text/html"); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(permissions, []string{"", "public-read"}) {
+		t.Fatal("unexpected publication permissions")
 	}
 }
 
@@ -206,7 +253,7 @@ func TestPublishPreservesExistingRulesWithoutDuplicates(t *testing.T) {
 		w.WriteHeader(http.StatusNoContent)
 	})
 	for range 2 {
-		if err := store.Publish(context.Background()); err != nil {
+		if err := store.Publish(context.Background(), nil); err != nil {
 			t.Fatal(err)
 		}
 		var document struct{ Statement []map[string]any }
@@ -231,7 +278,7 @@ func TestUnreadablePolicyIsNotOverwritten(t *testing.T) {
 			}
 			io.WriteString(w, body)
 		})
-		err := store.Publish(context.Background())
+		err := store.Publish(context.Background(), nil)
 		if err == nil || strings.Contains(err.Error(), "fake-secret") {
 			t.Fatal("unsafe policy handling")
 		}
