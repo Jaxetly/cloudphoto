@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/md5"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -31,13 +32,15 @@ type Store interface {
 }
 
 type S3 struct {
-	client *s3.Client
-	bucket string
+	client    *s3.Client
+	bucket    string
+	accessKey string
 }
 
 func New(bucket, accessKey, secretKey string) *S3 {
 	return &S3{
-		bucket: bucket,
+		bucket:    bucket,
+		accessKey: accessKey,
 		client: s3.New(s3.Options{
 			Region:                     "ru-central1",
 			BaseEndpoint:               aws.String("https://storage.yandexcloud.net"),
@@ -157,10 +160,52 @@ func (s *S3) Delete(ctx context.Context, keys []string) error {
 }
 
 func (s *S3) Publish(ctx context.Context) error {
-	// Имя бакета ограничено синтаксисом S3, но JSON всё равно строится безопасно.
-	policy := fmt.Sprintf(`{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":%q}]}`, "arn:aws:s3:::"+s.bucket+"/*")
 	request, cancel := context.WithTimeout(ctx, 45*time.Second)
-	_, err := s.client.PutBucketPolicy(request, &s3.PutBucketPolicyInput{Bucket: aws.String(s.bucket), Policy: aws.String(policy)}, withContentMD5)
+	existing, err := s.client.GetBucketPolicy(request, &s3.GetBucketPolicyInput{Bucket: aws.String(s.bucket)})
+	cancel()
+	var statements []json.RawMessage
+	if err != nil {
+		var api smithy.APIError
+		if !errors.As(err, &api) || api.ErrorCode() != "NoSuchBucketPolicy" {
+			return fmt.Errorf("Не удалось прочитать политику доступа: %w", safeError(err))
+		}
+	} else {
+		var document struct{ Statement []json.RawMessage }
+		if json.Unmarshal([]byte(aws.ToString(existing.Policy)), &document) != nil {
+			return errors.New("Не удалось прочитать политику доступа")
+		}
+		for _, statement := range document.Statement {
+			var rule struct{ Sid string }
+			if json.Unmarshal(statement, &rule) != nil {
+				return errors.New("Не удалось прочитать политику доступа")
+			}
+			if rule.Sid != "CloudphotoPublicPhotos" && rule.Sid != "CloudphotoApplication" && rule.Sid != "CloudphotoConsole" {
+				statements = append(statements, statement)
+			}
+		}
+	}
+	// Политика Яндекса — белый список: одного публичного GetObject недостаточно,
+	// иначе приложение потеряет доступ сразу после PutBucketPolicy.
+	resource := "arn:aws:s3:::" + s.bucket
+	for _, rule := range []map[string]any{
+		{"Sid": "CloudphotoPublicPhotos", "Effect": "Allow", "Principal": "*", "Action": "s3:GetObject", "Resource": resource + "/*"},
+		{"Sid": "CloudphotoApplication", "Effect": "Allow", "Principal": "*", "Action": "s3:*", "Resource": []string{resource, resource + "/*"},
+			"Condition": map[string]any{"StringEquals": map[string]string{"yc:access-key-id": s.accessKey}}},
+		{"Sid": "CloudphotoConsole", "Effect": "Allow", "Principal": "*", "Action": "s3:*", "Resource": []string{resource, resource + "/*"},
+			"Condition": map[string]any{"Bool": map[string]string{"aws:PrincipalIsAWSService": "true"}}},
+	} {
+		encoded, marshalErr := json.Marshal(rule)
+		if marshalErr != nil {
+			return errors.New("Не удалось подготовить политику доступа")
+		}
+		statements = append(statements, encoded)
+	}
+	policy, err := json.Marshal(map[string]any{"Version": "2012-10-17", "Statement": statements})
+	if err != nil {
+		return errors.New("Не удалось подготовить политику доступа")
+	}
+	request, cancel = context.WithTimeout(ctx, 45*time.Second)
+	_, err = s.client.PutBucketPolicy(request, &s3.PutBucketPolicyInput{Bucket: aws.String(s.bucket), Policy: aws.String(string(policy))}, withContentMD5)
 	cancel()
 	if err != nil {
 		return fmt.Errorf("Не удалось настроить публичное чтение: %w", safeError(err))

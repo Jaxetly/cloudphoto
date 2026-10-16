@@ -44,7 +44,7 @@ def main():
             safe = {"Нет доступа к облачному хранилищу", "Ошибка обращения к облачному хранилищу",
                     "Ошибка контрольной суммы S3-запроса", "Некорректный формат S3-запроса",
                     "Хранилище не ответило вовремя", "Бакет не найден"}
-            safe |= {prefix + ": " + reason for prefix in ("Не удалось настроить публичное чтение", "Не удалось настроить хостинг") for reason in list(safe)}
+            safe |= {prefix + ": " + reason for prefix in ("Не удалось прочитать политику доступа", "Не удалось настроить публичное чтение", "Не удалось настроить хостинг") for reason in list(safe)}
             detail = result.stderr.decode(errors="replace").strip()
             raise RuntimeError("Ошибка команды " + args[0] + ((": " + detail) if detail in safe else ""))
         if success and result.stderr:

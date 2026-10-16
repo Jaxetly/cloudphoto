@@ -30,6 +30,19 @@ def main():
     if command not in {"init", "validate", "plan", "apply"}:
         raise RuntimeError("Используйте init, validate, plan или apply")
     if command == "init":
+        identity = subprocess.run(["yc", "iam", "whoami", "--format", "json"],
+                                  capture_output=True, text=True, timeout=30)
+        try:
+            subject = json.loads(identity.stdout)
+        except ValueError:
+            raise RuntimeError("Не удалось определить администратора инфраструктуры")
+        if identity.returncode or not isinstance(subject, str) or not subject.isalnum():
+            raise RuntimeError("Не удалось определить администратора инфраструктуры")
+        local = TF / ".local"
+        local.mkdir(mode=0o700, exist_ok=True)
+        target = local / "administrator.json"
+        target.write_text(json.dumps({"id": subject}))
+        target.chmod(0o600)
         run(["init", "-input=false", "-no-color"])
         print("Terraform инициализирован")
     elif command == "validate":

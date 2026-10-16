@@ -98,10 +98,16 @@ func TestDeleteBatchesAndPerObjectErrors(t *testing.T) {
 	}
 }
 
-func TestPublishOnlyAllowsObjectReads(t *testing.T) {
+func TestPublishKeepsAuthenticatedAccessAndOnlyPublicReads(t *testing.T) {
 	var policy string
 	website := false
 	store := testStore(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			w.Header().Set("Content-Type", "application/xml")
+			w.WriteHeader(http.StatusNotFound)
+			io.WriteString(w, `<Error><Code>NoSuchBucketPolicy</Code></Error>`)
+			return
+		}
 		body, _ := io.ReadAll(r.Body)
 		sum := md5.Sum(body)
 		if r.Header.Get("Content-MD5") != base64.StdEncoding.EncodeToString(sum[:]) {
@@ -120,12 +126,36 @@ func TestPublishOnlyAllowsObjectReads(t *testing.T) {
 	}
 	var document struct {
 		Statement []struct {
-			Action   string
-			Resource string
+			Effect    string
+			Principal string
+			Action    string
+			Resource  json.RawMessage
+			Condition map[string]map[string]string
 		}
 	}
-	if err := json.Unmarshal([]byte(policy), &document); err != nil || len(document.Statement) != 1 || document.Statement[0].Action != "s3:GetObject" || document.Statement[0].Resource != "arn:aws:s3:::test.example/*" || !website {
+	if err := json.Unmarshal([]byte(policy), &document); err != nil || len(document.Statement) != 3 || !website {
 		t.Fatal("unsafe or incomplete publication settings")
+	}
+	for i, rule := range document.Statement {
+		if rule.Effect != "Allow" || rule.Principal != "*" {
+			t.Fatal("unexpected principal or effect")
+		}
+		if i == 0 {
+			if rule.Action != "s3:GetObject" || string(rule.Resource) != `"arn:aws:s3:::test.example/*"` || len(rule.Condition) != 0 {
+				t.Fatal("anonymous access must only allow object reads")
+			}
+			continue
+		}
+		var resources []string
+		if json.Unmarshal(rule.Resource, &resources) != nil || !reflect.DeepEqual(resources, []string{"arn:aws:s3:::test.example", "arn:aws:s3:::test.example/*"}) || rule.Action != "s3:*" || len(rule.Condition) != 1 {
+			t.Fatal("management access is not scoped to this bucket")
+		}
+		if i == 1 && !reflect.DeepEqual(rule.Condition, map[string]map[string]string{"StringEquals": {"yc:access-key-id": "fake-access"}}) {
+			t.Fatal("application must keep access through its authenticated key")
+		}
+		if i == 2 && !reflect.DeepEqual(rule.Condition, map[string]map[string]string{"Bool": {"aws:PrincipalIsAWSService": "true"}}) {
+			t.Fatal("console access must require an authenticated cloud service")
+		}
 	}
 }
 
@@ -133,6 +163,12 @@ func TestPublishErrorIdentifiesStepWithoutResponsePayload(t *testing.T) {
 	for _, denied := range []string{"policy", "website"} {
 		t.Run(denied, func(t *testing.T) {
 			store := testStore(t, func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodGet {
+					w.Header().Set("Content-Type", "application/xml")
+					w.WriteHeader(http.StatusNotFound)
+					io.WriteString(w, `<Error><Code>NoSuchBucketPolicy</Code></Error>`)
+					return
+				}
 				if r.URL.Query().Has(denied) {
 					w.Header().Set("Content-Type", "application/xml")
 					w.WriteHeader(http.StatusForbidden)
@@ -153,5 +189,51 @@ func TestPublishErrorIdentifiesStepWithoutResponsePayload(t *testing.T) {
 				t.Fatal("missing operation context")
 			}
 		})
+	}
+}
+
+func TestPublishPreservesExistingRulesWithoutDuplicates(t *testing.T) {
+	policy := `{"Version":"2012-10-17","Statement":[{"Sid":"InfrastructureAdministrator","Effect":"Allow","Principal":{"CanonicalUser":"test-admin"},"Action":"s3:*","Resource":"arn:aws:s3:::test.example"}]}`
+	store := testStore(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Has("policy") {
+			if r.Method == http.MethodGet {
+				io.WriteString(w, policy)
+				return
+			}
+			body, _ := io.ReadAll(r.Body)
+			policy = string(body)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+	for range 2 {
+		if err := store.Publish(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		var document struct{ Statement []map[string]any }
+		if json.Unmarshal([]byte(policy), &document) != nil || len(document.Statement) != 4 {
+			t.Fatal("existing rules lost or application rules duplicated")
+		}
+		if document.Statement[0]["Sid"] != "InfrastructureAdministrator" || document.Statement[0]["Principal"].(map[string]any)["CanonicalUser"] != "test-admin" {
+			t.Fatal("infrastructure access changed")
+		}
+	}
+}
+
+func TestUnreadablePolicyIsNotOverwritten(t *testing.T) {
+	for _, body := range []string{"broken JSON", `<Error><Code>AccessDenied</Code><Message>fake-secret</Message></Error>`} {
+		store := testStore(t, func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodGet {
+				t.Error("unreadable policy must not be replaced")
+			}
+			if strings.HasPrefix(body, "<") {
+				w.Header().Set("Content-Type", "application/xml")
+				w.WriteHeader(http.StatusForbidden)
+			}
+			io.WriteString(w, body)
+		})
+		err := store.Publish(context.Background())
+		if err == nil || strings.Contains(err.Error(), "fake-secret") {
+			t.Fatal("unsafe policy handling")
+		}
 	}
 }

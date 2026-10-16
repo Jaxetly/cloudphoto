@@ -32,6 +32,24 @@ resource "yandex_storage_bucket" "photos" {
   max_size      = 1073741824
   force_destroy = false
 
+  # Начальное правило сохраняется mksite вместе с публичным чтением фотографий.
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid       = "InfrastructureAdministrator"
+      Effect    = "Allow"
+      Principal = { CanonicalUser = jsondecode(file("${path.module}/.local/administrator.json")).id }
+      Action    = "s3:*"
+      Resource  = ["arn:aws:s3:::${var.bucket_name}", "arn:aws:s3:::${var.bucket_name}/*"]
+      }, {
+      Sid       = "ClientAccount"
+      Effect    = "Allow"
+      Principal = { CanonicalUser = yandex_iam_service_account.client.id }
+      Action    = "s3:*"
+      Resource  = ["arn:aws:s3:::${var.bucket_name}", "arn:aws:s3:::${var.bucket_name}/*"]
+    }]
+  })
+
   https {
     certificate_id = data.yandex_cm_certificate.existing.id
   }
