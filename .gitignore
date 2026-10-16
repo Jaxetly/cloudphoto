@@ -1,0 +1,48 @@
+# Локальные настройки и учётные данные
+.env
+.env.*
+.private/
+.local/
+.aws/
+credentials
+credentials.*
+key.json
+*_key.json
+*-key.json
+*credentials*.json
+*.pem
+*.key
+*.p12
+*.pfx
+*.asc
+*.gpg
+
+# Рабочие файлы Terraform. Lock-файл провайдера сохраняется в Git.
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+*.tfplan.*
+*.tfvars
+*.tfvars.json
+crash.log
+crash.*.log
+
+# Сборки и временные файлы проверок
+/bin/
+/dist/
+/cloudphoto
+/tmp/
+/test-results/
+*.test
+*.test.exe
+coverage.out
+*.log
+
+# Локальные файлы редактора и macOS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
