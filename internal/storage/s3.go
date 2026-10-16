@@ -55,8 +55,10 @@ func safeError(err error) error {
 	var api smithy.APIError
 	if errors.As(err, &api) {
 		switch api.ErrorCode() {
-		case "NoSuchKey", "NotFound", "NoSuchBucket", "404":
+		case "NoSuchKey", "NotFound", "404":
 			return ErrNotFound
+		case "NoSuchBucket":
+			return errors.New("Бакет не найден")
 		case "AccessDenied", "InvalidAccessKeyId", "SignatureDoesNotMatch", "403":
 			return errors.New("Нет доступа к облачному хранилищу")
 		}
@@ -87,13 +89,21 @@ func (s *S3) List(ctx context.Context, prefix string) ([]string, error) {
 }
 
 func (s *S3) Get(ctx context.Context, key string) (io.ReadCloser, error) {
-	// HTTPClient ограничивает также чтение тела; тело закрывает вызывающая сторона.
-	out, err := s.client.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(s.bucket), Key: aws.String(key)})
+	request, cancel := context.WithTimeout(ctx, 45*time.Second)
+	out, err := s.client.GetObject(request, &s3.GetObjectInput{Bucket: aws.String(s.bucket), Key: aws.String(key)})
 	if err != nil {
+		cancel()
 		return nil, safeError(err)
 	}
-	return out.Body, nil
+	return &timedBody{ReadCloser: out.Body, cancel: cancel}, nil
 }
+
+type timedBody struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (body *timedBody) Close() error { err := body.ReadCloser.Close(); body.cancel(); return err }
 
 func (s *S3) Put(ctx context.Context, key string, body io.Reader, size int64, contentType string) error {
 	request, cancel := context.WithTimeout(ctx, 45*time.Second)
