@@ -1,7 +1,10 @@
 package storage
 
 import (
+	"bytes"
 	"context"
+	"crypto/md5"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
@@ -62,10 +65,15 @@ func TestDeleteBatchesAndPerObjectErrors(t *testing.T) {
 	var counts []int
 	failed := false
 	store := testStore(t, func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		sum := md5.Sum(body)
+		if r.Header.Get("Content-MD5") != base64.StdEncoding.EncodeToString(sum[:]) || r.ContentLength != int64(len(body)) {
+			t.Error("required Content-MD5 or Content-Length missing")
+		}
 		var request struct {
 			Objects []struct{ Key string } `xml:"Object"`
 		}
-		if err := xml.NewDecoder(r.Body).Decode(&request); err != nil {
+		if err := xml.NewDecoder(bytes.NewReader(body)).Decode(&request); err != nil {
 			t.Error(err)
 		}
 		counts = append(counts, len(request.Objects))
@@ -93,13 +101,16 @@ func TestPublishOnlyAllowsObjectReads(t *testing.T) {
 	var policy string
 	website := false
 	store := testStore(t, func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		sum := md5.Sum(body)
+		if r.Header.Get("Content-MD5") != base64.StdEncoding.EncodeToString(sum[:]) {
+			t.Error("missing configuration checksum")
+		}
 		if r.URL.Query().Has("policy") {
-			b, _ := io.ReadAll(r.Body)
-			policy = string(b)
+			policy = string(body)
 		}
 		if r.URL.Query().Has("website") {
-			b, _ := io.ReadAll(r.Body)
-			website = string(b) != ""
+			website = len(body) != 0
 		}
 		w.WriteHeader(http.StatusNoContent)
 	})

@@ -2,6 +2,8 @@ package storage
 
 import (
 	"context"
+	"crypto/md5"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -14,6 +16,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
+	"github.com/aws/smithy-go/middleware"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 )
 
 var ErrNotFound = errors.New("Объект не найден")
@@ -136,7 +140,7 @@ func (s *S3) Delete(ctx context.Context, keys []string) error {
 		request, cancel := context.WithTimeout(ctx, 45*time.Second)
 		result, err := s.client.DeleteObjects(request, &s3.DeleteObjectsInput{
 			Bucket: aws.String(s.bucket), Delete: &types.Delete{Objects: objects, Quiet: aws.Bool(true)},
-		})
+		}, withContentMD5)
 		cancel()
 		if err != nil {
 			return safeError(err)
@@ -152,7 +156,7 @@ func (s *S3) Publish(ctx context.Context) error {
 	// Имя бакета ограничено синтаксисом S3, но JSON всё равно строится безопасно.
 	policy := fmt.Sprintf(`{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":%q}]}`, "arn:aws:s3:::"+s.bucket+"/*")
 	request, cancel := context.WithTimeout(ctx, 45*time.Second)
-	_, err := s.client.PutBucketPolicy(request, &s3.PutBucketPolicyInput{Bucket: aws.String(s.bucket), Policy: aws.String(policy)})
+	_, err := s.client.PutBucketPolicy(request, &s3.PutBucketPolicyInput{Bucket: aws.String(s.bucket), Policy: aws.String(policy)}, withContentMD5)
 	cancel()
 	if err != nil {
 		return safeError(err)
@@ -164,8 +168,30 @@ func (s *S3) Publish(ctx context.Context) error {
 			IndexDocument: &types.IndexDocument{Suffix: aws.String("index.html")},
 			ErrorDocument: &types.ErrorDocument{Key: aws.String("error.html")},
 		},
-	})
+	}, withContentMD5)
 	return safeError(err)
+}
+
+// S3 API Яндекса требует Content-MD5 для XML пакетного удаления.
+// MD5 здесь служит контрольной суммой запроса, а не защитой учётных данных.
+func withContentMD5(options *s3.Options) {
+	options.APIOptions = append(options.APIOptions, func(stack *middleware.Stack) error {
+		return stack.Build.Add(middleware.BuildMiddlewareFunc("ContentMD5", func(ctx context.Context, in middleware.BuildInput, next middleware.BuildHandler) (middleware.BuildOutput, middleware.Metadata, error) {
+			request, ok := in.Request.(*smithyhttp.Request)
+			if !ok {
+				return middleware.BuildOutput{}, middleware.Metadata{}, errors.New("Некорректный S3-запрос")
+			}
+			hash := md5.New()
+			if _, err := io.Copy(hash, request.GetStream()); err != nil {
+				return middleware.BuildOutput{}, middleware.Metadata{}, err
+			}
+			if err := request.RewindStream(); err != nil {
+				return middleware.BuildOutput{}, middleware.Metadata{}, err
+			}
+			request.Header.Set("Content-MD5", base64.StdEncoding.EncodeToString(hash.Sum(nil)))
+			return next.HandleBuild(ctx, in)
+		}), middleware.After)
+	})
 }
 
 func IsPhoto(name string) bool {
