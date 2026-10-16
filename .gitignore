@@ -38,6 +38,8 @@ crash.*.log
 *.test.exe
 coverage.out
 *.log
+__pycache__/
+*.pyc
 
 # Локальные файлы редактора и macOS
 .DS_Store

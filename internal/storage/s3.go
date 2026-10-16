@@ -71,10 +71,13 @@ func safeError(err error) error {
 
 func (s *S3) List(ctx context.Context, prefix string) ([]string, error) {
 	var keys []string
-	p := s3.NewListObjectsV2Paginator(s.client, &s3.ListObjectsV2Input{Bucket: aws.String(s.bucket), Prefix: aws.String(prefix)})
-	for p.HasMorePages() {
+	var token *string
+	seen := map[string]bool{}
+	for {
 		request, cancel := context.WithTimeout(ctx, 45*time.Second)
-		page, err := p.NextPage(request)
+		page, err := s.client.ListObjectsV2(request, &s3.ListObjectsV2Input{
+			Bucket: aws.String(s.bucket), Prefix: aws.String(prefix), ContinuationToken: token,
+		})
 		cancel()
 		if err != nil {
 			return nil, safeError(err)
@@ -84,8 +87,16 @@ func (s *S3) List(ctx context.Context, prefix string) ([]string, error) {
 				keys = append(keys, *object.Key)
 			}
 		}
+		if !aws.ToBool(page.IsTruncated) {
+			return keys, nil
+		}
+		next := aws.ToString(page.NextContinuationToken)
+		if next == "" || seen[next] {
+			return nil, errors.New("Хранилище вернуло некорректную страницу списка")
+		}
+		seen[next] = true
+		token = aws.String(next)
 	}
-	return keys, nil
 }
 
 func (s *S3) Get(ctx context.Context, key string) (io.ReadCloser, error) {
